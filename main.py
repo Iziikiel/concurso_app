@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from openai import OpenAI
+from supabase import create_client
 import os
 import json
 import re
@@ -12,6 +13,7 @@ load_dotenv()
 
 app = FastAPI()
 
+# 🔑 OpenAI / Groq
 client = OpenAI(
     api_key=os.getenv("API_KEY"),
     base_url=os.getenv("BASE_URL")
@@ -19,81 +21,103 @@ client = OpenAI(
 
 MODEL = os.getenv("MODEL")
 
-# =========================
-# CACHE (estoque de perguntas)
-# =========================
-cache_perguntas = {}
+# 🔑 Supabase
+supabase = create_client(
+    os.getenv("SUPABASE_URL"),
+    os.getenv("SUPABASE_KEY")
+)
 
 # =========================
-# GERAR VÁRIAS PERGUNTAS
+# BUSCAR NO BANCO
 # =========================
-def gerar_perguntas(materia, quantidade=5):
+def buscar_questao(disciplina):
+    try:
+        response = (
+            supabase
+            .table("questoes")
+            .select("*")
+            .eq("disciplina", disciplina.lower())
+            .limit(1)
+            .execute()
+        )
+
+        if response.data:
+            return response.data[0]
+
+        return None
+
+    except Exception as e:
+        print("Erro ao buscar:", e)
+        return None
+
+
+# =========================
+# SALVAR NO BANCO
+# =========================
+def salvar_questao(q, disciplina):
+    try:
+        supabase.table("questoes").insert({
+            "disciplina": disciplina.lower(),
+            "banca": q.get("banca"),
+            "nivel": q.get("nivel"),
+            "pergunta": q["pergunta"],
+            "alternativas": q["alternativas"],
+            "resposta_correta": q["correta"],
+            "explicacao": q["explicacao"]
+        }).execute()
+
+    except Exception as e:
+        print("Erro ao salvar:", e)
+
+
+# =========================
+# GERAR COM IA
+# =========================
+def gerar_pergunta(disciplina):
+
     prompt = f"""
-Gere {quantidade} questões de concurso sobre: {materia}.
+Gere 1 questão de concurso sobre {disciplina}.
 
-Varie entre fácil, médio e difícil.
+Retorne APENAS JSON:
 
-Responda APENAS em JSON (lista):
-
-[
-  {{
-    "pergunta": "...",
-    "alternativas": ["A","B","C","D"],
-    "correta": 0,
-    "explicacao": "..."
-  }}
-]
+{{
+  "pergunta": "...",
+  "alternativas": ["A","B","C","D"],
+  "correta": 0,
+  "explicacao": "...",
+  "banca": "FGV",
+  "nivel": "medio"
+}}
 """
 
     response = client.chat.completions.create(
         model=MODEL,
-        temperature=0.8,
+        temperature=0.7,
         messages=[{"role": "user", "content": prompt}]
     )
 
     texto = response.choices[0].message.content
     texto = re.sub(r"```json|```", "", texto).strip()
 
-    try:
-        perguntas = json.loads(texto)
-        return perguntas
-    except:
-        raise Exception("Erro ao gerar lista de perguntas")
+    return json.loads(texto)
+
 
 # =========================
-# PEGAR 1 PERGUNTA (com cache)
+# ENDPOINT PRINCIPAL
 # =========================
-def pegar_pergunta(materia):
-    # cria cache se não existir
-    if materia not in cache_perguntas:
-        cache_perguntas[materia] = []
-
-    # se acabou, gera mais
-    if len(cache_perguntas[materia]) == 0:
-        novas = gerar_perguntas(materia, 5)
-        cache_perguntas[materia].extend(novas)
-
-    # entrega 1 pergunta
-    return cache_perguntas[materia].pop(0)
-
-# =========================
-# ROTAS
-# =========================
-
-@app.get("/")
-def home():
-    return {"msg": "API rodando 🚀"}
-
 @app.get("/pergunta")
-def get_pergunta(materia: str):
-    try:
-        return pegar_pergunta(materia)
-    except Exception as e:
-        return {"erro": str(e)}
+def get_pergunta(disciplina: str):
 
-@app.get("/lote")
-def get_lote(materia: str):
-    try:
-        return gerar_perguntas(materia, 5)
-    except Exception as e:
-        return {"erro": str(e)}
+    # 1️⃣ tenta banco
+    questao = buscar_questao(disciplina)
+
+    if questao:
+        return questao
+
+    # 2️⃣ se não tiver → IA
+    nova = gerar_pergunta(disciplina)
+
+    # 3️⃣ salva no banco
+    salvar_questao(nova, disciplina)
+
+    return nova
